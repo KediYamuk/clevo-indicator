@@ -119,6 +119,8 @@ struct {
 }static menuitems[] = {
         { "Set FAN to AUTO", G_CALLBACK(ui_command_set_fan), 0, AUTO, NULL },
         { "", NULL, 0L, NA, NULL },
+        { "Set FAN to  40%", G_CALLBACK(ui_command_set_fan), 40, MANUAL, NULL },
+        { "Set FAN to  50%", G_CALLBACK(ui_command_set_fan), 50, MANUAL, NULL },
         { "Set FAN to  60%", G_CALLBACK(ui_command_set_fan), 60, MANUAL, NULL },
         { "Set FAN to  70%", G_CALLBACK(ui_command_set_fan), 70, MANUAL, NULL },
         { "Set FAN to  80%", G_CALLBACK(ui_command_set_fan), 80, MANUAL, NULL },
@@ -451,12 +453,12 @@ static int ec_auto_duty_adjust(void) {
         return 90;
     if (temp >= 60 && duty < 80)
         return 80;
-    if (temp >= 50 && duty < 70)
-        return 70;
-    if (temp >= 40 && duty < 60)
+    if (temp >= 50 && duty < 60)
         return 60;
-    if (temp >= 30 && duty < 50)
-        return 50;
+    if (temp >= 40 && duty < 40)
+        return 40;
+    if (temp >= 30 && duty < 40)
+        return 40;
     if (temp >= 20 && duty < 40)
         return 40;
     if (temp >= 10 && duty < 30)
@@ -466,12 +468,12 @@ static int ec_auto_duty_adjust(void) {
         return 30;
     if (temp <= 25 && duty > 40)
         return 40;
-    if (temp <= 35 && duty > 50)
-        return 50;
-    if (temp <= 45 && duty > 60)
+    if (temp <= 35 && duty > 40)
+        return 40;
+    if (temp <= 45 && duty > 40)
+        return 40;
+    if (temp <= 55 && duty > 60)
         return 60;
-    if (temp <= 55 && duty > 70)
-        return 70;
     if (temp <= 65 && duty > 80)
         return 80;
     if (temp <= 75 && duty > 90)
@@ -500,7 +502,7 @@ static int ec_query_fan_rpms(void) {
 }
 
 static int ec_write_fan_duty(int duty_percentage) {
-    if (duty_percentage < 60 || duty_percentage > 100) {
+    if (duty_percentage < 40 || duty_percentage > 100) {
         printf("Wrong fan duty to write: %d\n", duty_percentage);
         return EXIT_FAILURE;
     }
