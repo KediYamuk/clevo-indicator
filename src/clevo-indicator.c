@@ -2,7 +2,7 @@
  ============================================================================
  Name        : clevo-indicator.c
  Author      : AqD <iiiaqd@gmail.com>
- Version     :
+ Version     : 0.1
  Description : Ubuntu fan control indicator for Clevo laptops
 
  Based on http://www.association-apml.fr/upload/fanctrl.c by Jonas Diemer
@@ -27,6 +27,9 @@
  aggressive than the builtin algorithm in order to keep the temperatures below
  60°C all the time, for maximized performance with Intel turbo boost enabled.
 
+ Version 0.1: added experimental support for two fans based on Clevo NH55RDQ
+ by https://github.com/deebfeast
+
  ============================================================================
  */
 
@@ -46,15 +49,19 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
 
-#include <libayatana-appindicator3-0.1/libayatana-appindicator/app-indicator.h>
+#include <libayatana-appindicator/app-indicator.h>
 
 #define NAME "clevo-indicator"
 
 #define EC_SC 0x66
+#define EC_SC2 0x67
 #define EC_DATA 0x62
+#define EC_DATA2 0x63
 
 #define IBF 1
+#define IBF2 2
 #define OBF 0
 #define EC_SC_READ_CMD 0x80
 
@@ -68,8 +75,11 @@
 #define EC_REG_CPU_TEMP 0x07
 #define EC_REG_GPU_TEMP 0xCD
 #define EC_REG_FAN_DUTY 0xCE
+#define EC_REG_FA2_DUTY 0xCF
 #define EC_REG_FAN_RPMS_HI 0xD0
 #define EC_REG_FAN_RPMS_LO 0xD1
+#define EC_REG_FA2_RPMS_HI 0xD2
+#define EC_REG_FA2_RPMS_LO 0xD3
 
 #define MAX_FAN_RPM 4400.0
 
@@ -93,9 +103,10 @@ static int ec_init(void);
 static int ec_auto_duty_adjust(void);
 static int ec_query_cpu_temp(void);
 static int ec_query_gpu_temp(void);
-static int ec_query_fan_duty(void);
+static int ec_query_fan_duty(int fan_number);
 static int ec_query_fan_rpms(void);
-static int ec_write_fan_duty(int duty_percentage);
+static int ec_query_fa2_rpms(void);
+static int ec_write_fan_duty(int duty_percentage, int fan_number);
 static int ec_io_wait(const uint32_t port, const uint32_t flag,
         const char value);
 static uint8_t ec_io_read(const uint32_t port);
@@ -119,10 +130,11 @@ struct {
 }static menuitems[] = {
         { "Set FAN to AUTO", G_CALLBACK(ui_command_set_fan), 0, AUTO, NULL },
         { "", NULL, 0L, NA, NULL },
+        { "Set FAN to  0%", G_CALLBACK(ui_command_set_fan), 0, MANUAL, NULL },
+        { "Set FAN to  20%", G_CALLBACK(ui_command_set_fan), 20, MANUAL, NULL },
+        { "Set FAN to  30%", G_CALLBACK(ui_command_set_fan), 30, MANUAL, NULL },
         { "Set FAN to  40%", G_CALLBACK(ui_command_set_fan), 40, MANUAL, NULL },
-        { "Set FAN to  50%", G_CALLBACK(ui_command_set_fan), 50, MANUAL, NULL },
         { "Set FAN to  60%", G_CALLBACK(ui_command_set_fan), 60, MANUAL, NULL },
-        { "Set FAN to  70%", G_CALLBACK(ui_command_set_fan), 70, MANUAL, NULL },
         { "Set FAN to  80%", G_CALLBACK(ui_command_set_fan), 80, MANUAL, NULL },
         { "Set FAN to  90%", G_CALLBACK(ui_command_set_fan), 90, MANUAL, NULL },
         { "Set FAN to 100%", G_CALLBACK(ui_command_set_fan), 100, MANUAL, NULL },
@@ -143,6 +155,8 @@ struct {
     volatile int manual_next_fan_duty;
     volatile int manual_prev_fan_duty;
 }static *share_info = NULL;
+
+struct timespec delta = {1 /*secs*/, 0 /*nanosecs*/};
 
 static pid_t parent_pid = 0;
 
@@ -200,7 +214,7 @@ Usage: clevo-indicator [fan-duty-percentage]\n\
 Dump/Control fan duty on Clevo laptops. Display indicator by default.\n\
 \n\
 Arguments:\n\
-  [fan-duty-percentage]\t\tTarget fan duty in percentage, from 40 to 100\n\
+  [fan-duty-percentage]\t\tTarget fan duty in percentage, from 20 to 100\n\
   -?\t\t\t\tDisplay this help and exit\n\
 \n\
 Without arguments this program should attempt to display an indicator in\n\
@@ -228,7 +242,7 @@ DO NOT MANIPULATE OR QUERY EC I/O PORTS WHILE THIS PROGRAM IS RUNNING.\n\
             return main_dump_fan();
         } else {
             int val = atoi(argv[1]);
-            if (val < 40 || val > 100)
+            if (val < 0 || val > 100)
                     {
                 printf("invalid fan duty %d!\n", val);
                 return EXIT_FAILURE;
@@ -267,7 +281,8 @@ static int main_ec_worker(void) {
         int new_fan_duty = share_info->manual_next_fan_duty;
         if (new_fan_duty != 0
                 && new_fan_duty != share_info->manual_prev_fan_duty) {
-            ec_write_fan_duty(new_fan_duty);
+            ec_write_fan_duty(new_fan_duty,1);
+            ec_write_fan_duty(new_fan_duty,2);
             share_info->manual_prev_fan_duty = new_fan_duty;
         }
         // read EC
@@ -288,29 +303,33 @@ static int main_ec_worker(void) {
             share_info->fan_duty = calculate_fan_duty(buf[EC_REG_FAN_DUTY]);
             share_info->fan_rpms = calculate_fan_rpms(buf[EC_REG_FAN_RPMS_HI],
                     buf[EC_REG_FAN_RPMS_LO]);
-            /*
-             printf("temp=%d, duty=%d, rpms=%d\n", share_info->cpu_temp,
-             share_info->fan_duty, share_info->fan_rpms);
-             */
+            
+             //printf("temp=%d, duty=%d, rpms=%d\n", share_info->cpu_temp,
+             //share_info->fan_duty, share_info->fan_rpms);
+             
             break;
         default:
             printf("wrong EC size from sysfs: %ld\n", len);
         }
         close(io_fd);
         // auto EC
+        // printf("auto_duty = %d, prev_duty = %d, next_duty= %d\n", share_info->auto_duty, share_info->manual_prev_fan_duty, share_info->manual_next_fan_duty );
         if (share_info->auto_duty == 1) {
             int next_duty = ec_auto_duty_adjust();
             if (next_duty != 0 && next_duty != share_info->auto_duty_val) {
                 char s_time[256];
                 get_time_string(s_time, 256, "%m/%d %H:%M:%S");
-                printf("%s CPU=%d°C, GPU=%d°C, auto fan duty to %d%%\n", s_time,
-                        share_info->cpu_temp, share_info->gpu_temp, next_duty);
-                ec_write_fan_duty(next_duty);
+                // printf("%s CPU=%d°C, GPU=%d°C, auto fan duty to %d%%\n", s_time,
+                // printf("%s CPU=%d°C, auto fan duty to %d%%\n", s_time,
+                //        share_info->cpu_temp, next_duty);
+                ec_write_fan_duty(next_duty,1);
+                ec_write_fan_duty(next_duty,2);
                 share_info->auto_duty_val = next_duty;
             }
         }
         //
-        usleep(200 * 1000);
+        // usleep(200 * 1000);
+        nanosleep(&delta, &delta);
     }
     printf("worker quit\n");
     return EXIT_SUCCESS;
@@ -345,7 +364,7 @@ static void main_ui_worker(int argc, char** argv) {
     app_indicator_set_label(indicator, "Init..", "XX");
     app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ATTENTION);
     app_indicator_set_ordering_index(indicator, -2);
-    app_indicator_set_title(indicator, "Clevo");
+    app_indicator_set_title(indicator, "Clevo indicator");
     app_indicator_set_menu(indicator, GTK_MENU(indicator_menu));
     g_timeout_add(500, &ui_update, NULL);
     ui_toggle_menuitems(share_info->fan_duty);
@@ -367,16 +386,19 @@ static void main_on_sigterm(int signum) {
 
 static int main_dump_fan(void) {
     printf("Dump fan information\n");
-    printf("  FAN Duty: %d%%\n", ec_query_fan_duty());
+    printf("  FAN Duty: %d%%\n", ec_query_fan_duty(1));
+    printf("  FA2 Duty: %d%%\n", ec_query_fan_duty(2));
     printf("  FAN RPMs: %d RPM\n", ec_query_fan_rpms());
+    printf("  FA2 RPMs: %d RPM\n", ec_query_fa2_rpms());
     printf("  CPU Temp: %d°C\n", ec_query_cpu_temp());
     printf("  GPU Temp: %d°C\n", ec_query_gpu_temp());
     return EXIT_SUCCESS;
 }
 
 static int main_test_fan(int duty_percentage) {
-    printf("Change fan duty to %d%%\n", duty_percentage);
-    ec_write_fan_duty(duty_percentage);
+    printf("Change fans duty to %d%%\n", duty_percentage);
+    ec_write_fan_duty(duty_percentage,1);
+    ec_write_fan_duty(duty_percentage,2);
     printf("\n");
     main_dump_fan();
     return EXIT_SUCCESS;
@@ -384,12 +406,15 @@ static int main_test_fan(int duty_percentage) {
 
 static gboolean ui_update(gpointer user_data) {
     char label[256];
-    sprintf(label, "%d℃ %d℃", share_info->cpu_temp, share_info->gpu_temp);
-    app_indicator_set_label(indicator, label, "XXXXXX");
+    // sprintf(label, "%d℃ %d℃", share_info->cpu_temp, share_info->gpu_temp)
+    sprintf(label, "%d℃", share_info->cpu_temp);
+    // app_indicator_set_label(indicator, label, "XXXXXX");
+    app_indicator_set_label(indicator, label, "XXX");
     char icon_name[256];
     double load = ((double) share_info->fan_rpms) / MAX_FAN_RPM * 100.0;
     double load_r = round(load / 5.0) * 5.0;
     sprintf(icon_name, "brasero-disc-%02d", (int) load_r);
+    // sprintf(icon_name, "/usr/local/share/clevo2-indicator.png");
     app_indicator_set_icon(indicator, icon_name);
     return G_SOURCE_CONTINUE;
 }
@@ -449,35 +474,31 @@ static int ec_auto_duty_adjust(void) {
     //
     if (temp >= 80 && duty < 100)
         return 100;
-    if (temp >= 70 && duty < 90)
-        return 90;
-    if (temp >= 60 && duty < 80)
+    if (temp >= 70 && duty < 80)
         return 80;
-    if (temp >= 50 && duty < 60)
+    if (temp >= 60 && duty < 60)
         return 60;
+    if (temp >= 55 && duty < 50)
+        return 50;
     if (temp >= 40 && duty < 40)
         return 40;
-    if (temp >= 30 && duty < 40)
-        return 40;
-    if (temp >= 20 && duty < 40)
-        return 40;
-    if (temp >= 10 && duty < 30)
+    if (temp >= 30 && duty < 30)
         return 30;
     //
-    if (temp <= 15 && duty > 30)
+    if (temp <= 15 && duty > 0)
+        return 0;
+    if (temp <= 25 && duty > 20)
+        return 20;
+    if (temp <= 35 && duty > 30)
         return 30;
-    if (temp <= 25 && duty > 40)
-        return 40;
-    if (temp <= 35 && duty > 40)
-        return 40;
     if (temp <= 45 && duty > 40)
         return 40;
-    if (temp <= 55 && duty > 60)
+    if (temp <= 55 && duty > 50)
+        return 50;
+    if (temp <= 65 && duty > 60)
         return 60;
-    if (temp <= 65 && duty > 80)
+    if (temp <= 75 && duty > 80)
         return 80;
-    if (temp <= 75 && duty > 90)
-        return 90;
     //
     return 0;
 }
@@ -490,8 +511,14 @@ static int ec_query_gpu_temp(void) {
     return ec_io_read(EC_REG_GPU_TEMP);
 }
 
-static int ec_query_fan_duty(void) {
-    int raw_duty = ec_io_read(EC_REG_FAN_DUTY);
+static int ec_query_fan_duty(int fan_number) {
+    int raw_duty;
+    if (fan_number == 2) {
+        raw_duty = ec_io_read(EC_REG_FA2_DUTY);
+    }
+    else {
+        raw_duty = ec_io_read(EC_REG_FAN_DUTY);
+    }
     return calculate_fan_duty(raw_duty);
 }
 
@@ -501,14 +528,20 @@ static int ec_query_fan_rpms(void) {
     return calculate_fan_rpms(raw_rpm_hi, raw_rpm_lo);
 }
 
-static int ec_write_fan_duty(int duty_percentage) {
-    if (duty_percentage < 40 || duty_percentage > 100) {
+static int ec_query_fa2_rpms(void) {
+    int raw_rpm_hi = ec_io_read(EC_REG_FA2_RPMS_HI);
+    int raw_rpm_lo = ec_io_read(EC_REG_FA2_RPMS_LO);
+    return calculate_fan_rpms(raw_rpm_hi, raw_rpm_lo);
+}
+
+static int ec_write_fan_duty(int duty_percentage, int fan_number) {
+    if (duty_percentage < 0 || duty_percentage > 100) {
         printf("Wrong fan duty to write: %d\n", duty_percentage);
         return EXIT_FAILURE;
     }
     double v_d = ((double) duty_percentage) / 100.0 * 255.0;
     int v_i = (int) v_d;
-    return ec_io_do(0x99, 0x01, v_i);
+    return ec_io_do(0x99, fan_number, v_i);
 }
 
 static int ec_io_wait(const uint32_t port, const uint32_t flag,
