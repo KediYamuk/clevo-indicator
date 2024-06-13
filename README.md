@@ -17,7 +17,7 @@ Build and Install
 For Ubuntu 22.04:
 ```shell
 sudo apt install libayatana-appindicator3-dev libgtk-3-dev
-git clone https://github.com/grizzlei/clevo-indicator.git
+git clone https://github.com/KediYamuk/clevo-indicator.git
 cd clevo-indicator
 make install
 ```
